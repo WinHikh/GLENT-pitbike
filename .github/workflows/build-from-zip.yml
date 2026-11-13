@@ -1,0 +1,122 @@
+
+name: Build Android APK from one ZIP
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - '*.zip'
+      - '.github/workflows/build-from-zip.yml'
+  workflow_dispatch:
+    inputs:
+      archive_name:
+        description: 'ZIP file in repository root (leave empty to use the newest ZIP)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: glent-zip-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Extract ZIP and build APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Select and safely extract project ZIP
+        id: project
+        shell: bash
+        env:
+          REQUESTED_ARCHIVE: ${{ inputs.archive_name }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${REQUESTED_ARCHIVE:-}" ]]; then
+            ARCHIVE="$REQUESTED_ARCHIVE"
+            test -f "$ARCHIVE" || { echo "ZIP not found: $ARCHIVE"; exit 1; }
+          else
+            mapfile -t ZIPS < <(find . -maxdepth 1 -type f -iname '*.zip' -printf '%f\n' | sort)
+            if [[ ${#ZIPS[@]} -eq 0 ]]; then echo 'No .zip file found in repository root.'; exit 1; fi
+            ARCHIVE="${ZIPS[0]}"
+          fi
+          echo "Using archive: $ARCHIVE"
+          python3 - "$ARCHIVE" <<'PY'
+          import sys, zipfile
+          from pathlib import PurePosixPath
+          archive = sys.argv[1]
+          with zipfile.ZipFile(archive) as z:
+              for info in z.infolist():
+                  p = PurePosixPath(info.filename)
+                  if p.is_absolute() or '..' in p.parts:
+                      raise SystemExit(f'Unsafe path in ZIP: {info.filename}')
+              z.extractall('unzipped')
+          PY
+          PROJECT_DIR="$(find unzipped -type f -name ProjectVersion.txt -printf '%h\n' | head -n1)"
+          if [[ -z "$PROJECT_DIR" ]]; then
+            echo 'Could not find ProjectSettings/ProjectVersion.txt in the ZIP.'
+            echo 'The archive must contain a Unity project (Assets, Packages, ProjectSettings).'
+            exit 1
+          fi
+          PROJECT_DIR="$(dirname "$PROJECT_DIR")"
+          test -d "$PROJECT_DIR/Assets" || { echo 'Unity Assets folder missing.'; exit 1; }
+          test -d "$PROJECT_DIR/Packages" || { echo 'Unity Packages folder missing.'; exit 1; }
+          mkdir -p build-project
+          cp -a "$PROJECT_DIR/." build-project/
+          echo "project_path=build-project" >> "$GITHUB_OUTPUT"
+          echo "Detected Unity project at: $PROJECT_DIR"
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+
+      - name: Cache Unity Library
+        uses: actions/cache@v4
+        with:
+          path: build-project/Library
+          key: Library-Android-${{ hashFiles('unzipped/**/Assets/**', 'unzipped/**/Packages/**', 'unzipped/**/ProjectSettings/**') }}
+          restore-keys: |
+            Library-Android-
+
+      - name: Build APK with Unity 2022.3 LTS
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          projectPath: build-project
+          unityVersion: 2022.3.62f1
+          targetPlatform: Android
+          buildMethod: GlentAndroidBuild.Build
+          buildsPath: build
+          buildName: GLENT-Pitbike
+          androidExportType: androidPackage
+          allowDirtyBuild: true
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s build/Android/GLENT-Pitbike.apk
+          ls -lh build/Android/GLENT-Pitbike.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GLENT-Pitbike-Android-APK
+          path: build/Android/GLENT-Pitbike.apk
+          if-no-files-found: error
+          retention-days: 14
